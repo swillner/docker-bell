@@ -1,0 +1,12 @@
+[Unit]
+Description=Docker Bell
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/docker-bell
+Restart=always
+RestartSec=10
+SyslogIdentifier=docker-bell
+
+[Install]
+WantedBy=multi-user.target
