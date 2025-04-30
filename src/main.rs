@@ -142,7 +142,8 @@ async fn run_docker_compose(
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!(
-                "Failed to run docker compose: {}",
+                "Failed to run docker compose\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
         )))
@@ -164,7 +165,8 @@ async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> Result<(), B
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!(
-                "Failed to run git: {}",
+                "Failed to run git\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
         )))
