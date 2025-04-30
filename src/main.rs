@@ -131,8 +131,7 @@ async fn run_docker_compose(
         info.project.clone(),
     ];
     args.extend(command);
-    args.extend(vec![info.service.clone()]);
-    tracing::debug!("running: docker {:?}", args);
+    tracing::debug!("running: docker compose {:?}", args);
     let output = tokio::process::Command::new(docker_path)
         .args(args)
         .output()
@@ -143,7 +142,29 @@ async fn run_docker_compose(
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!(
-                "Failed to run docker-compose: {}",
+                "Failed to run docker compose: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )))
+    }
+}
+
+async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let git_path = "/usr/bin/git";
+    let mut args = vec!["-C".to_string(), info.working_dir.clone()];
+    args.extend(command);
+    tracing::debug!("running: git {:?}", args);
+    let output = tokio::process::Command::new(git_path)
+        .args(args)
+        .output()
+        .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Failed to run git: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
         )))
@@ -172,6 +193,9 @@ type HandlerResult<T> = Result<T, (StatusCode, Json<ServerErrorRes>)>;
 pub struct PostRebuildReq {
     pub key: String,
     pub build_args: Option<Vec<String>>,
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub all_services: bool,
 }
 
 async fn post_rebuild(
@@ -191,7 +215,17 @@ async fn post_rebuild(
         if let Some(build_args) = req.build_args {
             args.extend(build_args);
         }
+        if !req.all_services {
+            args.extend(vec![info.service.clone()]);
+        }
         async {
+            if let Some(commit) = req.commit {
+                run_git(
+                    &info,
+                    vec!["fetch".to_string(), "origin".to_string(), commit],
+                )
+                .await?;
+            }
             run_docker_compose(&info, args).await?;
             run_docker_compose(&info, vec!["up".to_string(), "--detach".to_string()]).await?;
             Ok("OK".to_string())
