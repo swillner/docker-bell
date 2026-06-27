@@ -11,6 +11,7 @@ use std::error::Error;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
+use tokio::time::{Duration, sleep};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
 
@@ -144,31 +145,45 @@ async fn handle_docker_events(state: SharedState, docker_path: String) {
             EventFilter::Type(EventFilterType::Container),
         ])
         .build();
-    let mut event_stream = docker.events(&opts);
-    while let Some(Ok(event)) = event_stream.next().await {
-        let (Some(action), Some(type_), Some(actor)) = (event.action, event.type_, event.actor)
-        else {
-            continue;
-        };
-        if type_ != "container" {
-            continue;
-        }
-        let Some(attributes) = actor.attributes else {
-            continue;
-        };
-        let Some(token) = attributes.get("bell.token").cloned() else {
-            continue;
-        };
 
-        match action.as_str() {
-            "die" => {
-                state.write().unwrap().managed_containers.remove(&token);
+    loop {
+        let mut event_stream = docker.events(&opts);
+        while let Some(event) = event_stream.next().await {
+            let event = match event {
+                Ok(event) => event,
+                Err(err) => {
+                    tracing::warn!("Docker event stream error: {}", err);
+                    break;
+                }
+            };
+
+            let (Some(action), Some(type_), Some(actor)) = (event.action, event.type_, event.actor)
+            else {
+                continue;
+            };
+            if type_ != "container" {
+                continue;
             }
-            "start" => {
-                state.write().unwrap().managed_containers.add(attributes);
+            let Some(attributes) = actor.attributes else {
+                continue;
+            };
+            let Some(token) = attributes.get("bell.token").cloned() else {
+                continue;
+            };
+
+            match action.as_str() {
+                "die" => {
+                    state.write().unwrap().managed_containers.remove(&token);
+                }
+                "start" => {
+                    state.write().unwrap().managed_containers.add(attributes);
+                }
+                _ => {}
             }
-            _ => {}
         }
+
+        tracing::warn!("Docker event stream ended, reconnecting");
+        sleep(Duration::from_secs(1)).await;
     }
 }
 
