@@ -8,6 +8,7 @@ use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::io;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -16,6 +17,8 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
 
 type SharedState = Arc<RwLock<AppState>>;
+type AppError = Box<dyn Error + Send + Sync>;
+type AppResult<T> = Result<T, AppError>;
 
 struct AppState {
     docker_path: String,
@@ -93,19 +96,20 @@ impl ManagedContainers {
     }
 }
 
-async fn initialize_containers(state: SharedState, docker_path: String) {
+async fn initialize_containers(state: SharedState, docker_path: String) -> AppResult<()> {
     let docker = Docker::unix(docker_path.as_str());
     let containers = docker.containers();
     let opts = ContainerListOpts::builder()
         .filter(vec![ContainerFilter::LabelKey("bell.token".to_string())])
         .build();
-    let containers = containers.list(&opts).await.unwrap();
+    let containers = containers.list(&opts).await?;
     let mut state = state.write().unwrap();
     for container in containers {
         if let Some(labels) = container.labels {
             state.managed_containers.add(labels);
         }
     }
+    Ok(())
 }
 
 async fn refresh_container_from_docker(
@@ -187,10 +191,7 @@ async fn handle_docker_events(state: SharedState, docker_path: String) {
     }
 }
 
-async fn run_docker_compose(
-    info: &DockerComposeInfo,
-    command: Vec<String>,
-) -> Result<(), Box<dyn Error>> {
+async fn run_docker_compose(info: &DockerComposeInfo, command: Vec<String>) -> AppResult<()> {
     let docker_path = "/usr/bin/docker";
     let mut args = vec![
         "compose".to_string(),
@@ -218,7 +219,7 @@ async fn run_docker_compose(
     }
 }
 
-async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> Result<(), Box<dyn Error>> {
+async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> AppResult<()> {
     let git_path = "/usr/bin/git";
     let mut args = vec!["-C".to_string(), info.working_dir.clone()];
     args.extend(command);
@@ -238,15 +239,16 @@ async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> Result<(), B
     }
 }
 
-async fn run_server(state: SharedState, address: String) {
+async fn run_server(state: SharedState, address: String) -> AppResult<()> {
     let app = Router::new()
         .route("/rebuild", post(post_rebuild))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    let listener = TcpListener::bind(address.as_str()).await.unwrap();
+    let listener = TcpListener::bind(address.as_str()).await?;
     tracing::debug!("listening on {}", address);
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -324,7 +326,7 @@ async fn post_rebuild(
         Ok("OK".to_string())
     }
     .await
-    .map_err(|e: Box<dyn Error>| {
+    .map_err(|e: AppError| {
         tracing::error!("Error: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -346,7 +348,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> AppResult<()> {
     let filter = tracing_subscriber::filter::Targets::new()
         .with_target("tower_http::trace::on_response", tracing::Level::DEBUG)
         .with_target("tower_http::trace::on_request", tracing::Level::DEBUG)
@@ -364,18 +366,23 @@ async fn main() {
         managed_containers: ManagedContainers::new(),
     }));
 
-    initialize_containers(shared_state.clone(), args.docker_path.clone()).await;
+    initialize_containers(shared_state.clone(), args.docker_path.clone()).await?;
 
     let mut tasks = JoinSet::new();
 
-    tasks.spawn(handle_docker_events(
-        shared_state.clone(),
-        args.docker_path.clone(),
-    ));
+    let event_state = shared_state.clone();
+    let event_docker_path = args.docker_path.clone();
+    tasks.spawn(async move {
+        handle_docker_events(event_state, event_docker_path).await;
+        Ok(())
+    });
 
     tasks.spawn(run_server(shared_state.clone(), args.address));
 
-    while tasks.join_next().await.is_some() {
+    while let Some(result) = tasks.join_next().await {
+        result.map_err(|err| io::Error::other(format!("task failed: {err}")))??;
         tracing::debug!("task finished");
     }
+
+    Ok(())
 }
