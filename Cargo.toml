@@ -1,17 +1,16 @@
 [package]
 name = "docker-bell"
-version = "0.1.0"
-edition = "2021"
+authors = ["Sven Willner <sven.willner@gmail.com>"]
+version = "0.2.0"
+edition = "2024"
 
 [dependencies]
-axum = "0.7"
-axum-macros = "0"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
-docker-api = "0"
-env_logger = "0"
-futures-util = "0"
+docker-api = "0.14"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
-tower-http = { version = "0", features = ["auth", "trace", "validate-request"] }
-tracing = "0"
-tracing-subscriber = "0"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread"] }
+tower-http = { version = "0.7", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

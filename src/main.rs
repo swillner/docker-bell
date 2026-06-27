@@ -1,9 +1,9 @@
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use clap::Parser;
+use docker_api::Docker;
 use docker_api::opts::{
     ContainerFilter, ContainerListOpts, EventFilter, EventFilterType, EventsOpts,
 };
-use docker_api::Docker;
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,12 +12,12 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower_http::trace::TraceLayer;
-use tracing;
 use tracing_subscriber::prelude::*;
 
 type SharedState = Arc<RwLock<AppState>>;
 
 struct AppState {
+    docker_path: String,
     managed_containers: ManagedContainers,
 }
 
@@ -33,6 +33,30 @@ struct ManagedContainers {
     containers: HashMap<String, DockerComposeInfo>,
 }
 
+fn compose_info_from_labels(
+    labels: &HashMap<String, String>,
+) -> Option<(String, DockerComposeInfo)> {
+    if let (Some(token), Some(service), Some(project), Some(config_files), Some(working_dir)) = (
+        labels.get("bell.token"),
+        labels.get("com.docker.compose.service"),
+        labels.get("com.docker.compose.project"),
+        labels.get("com.docker.compose.project.config_files"),
+        labels.get("com.docker.compose.project.working_dir"),
+    ) {
+        Some((
+            token.clone(),
+            DockerComposeInfo {
+                project: project.clone(),
+                service: service.clone(),
+                config_files: config_files.clone(),
+                working_dir: working_dir.clone(),
+            },
+        ))
+    } else {
+        None
+    }
+}
+
 impl ManagedContainers {
     pub fn new() -> Self {
         ManagedContainers {
@@ -41,23 +65,20 @@ impl ManagedContainers {
     }
 
     pub fn add(&mut self, labels: HashMap<String, String>) {
-        if let (Some(token), Some(service), Some(project), Some(config_files), Some(working_dir)) = (
-            labels.get("bell.token"),
-            labels.get("com.docker.compose.service"),
-            labels.get("com.docker.compose.project"),
-            labels.get("com.docker.compose.project.config_files"),
-            labels.get("com.docker.compose.project.working_dir"),
-        ) {
-            self.containers.insert(
-                token.clone(),
-                DockerComposeInfo {
-                    project: project.clone(),
-                    service: service.clone(),
-                    config_files: config_files.clone(),
-                    working_dir: working_dir.clone(),
-                },
+        if let Some((token, info)) = compose_info_from_labels(&labels) {
+            self.containers.insert(token.clone(), info);
+            tracing::info!(
+                "adding {}: {}/{}",
+                token,
+                labels
+                    .get("com.docker.compose.project")
+                    .map(|s| s.as_str())
+                    .unwrap_or("<unknown>"),
+                labels
+                    .get("com.docker.compose.service")
+                    .map(|s| s.as_str())
+                    .unwrap_or("<unknown>")
             );
-            tracing::info!("adding {}: {}/{}", token, project, service);
         }
     }
 
@@ -86,6 +107,35 @@ async fn initialize_containers(state: SharedState, docker_path: String) {
     }
 }
 
+async fn refresh_container_from_docker(
+    state: SharedState,
+    token: &str,
+) -> Option<DockerComposeInfo> {
+    let docker_path = { state.read().unwrap().docker_path.clone() };
+    let docker = Docker::unix(docker_path.as_str());
+    let opts = ContainerListOpts::builder()
+        .all(true)
+        .filter(vec![ContainerFilter::LabelKey("bell.token".to_string())])
+        .build();
+    let containers = docker.containers().list(&opts).await.ok()?;
+
+    for container in containers {
+        let Some(labels) = container.labels else {
+            continue;
+        };
+
+        if labels.get("bell.token").is_some_and(|t| t == token)
+            && let Some((_, info)) = compose_info_from_labels(&labels)
+        {
+            let info_clone = info.clone();
+            state.write().unwrap().managed_containers.add(labels);
+            return Some(info_clone);
+        }
+    }
+
+    None
+}
+
 async fn handle_docker_events(state: SharedState, docker_path: String) {
     let docker = Docker::unix(docker_path.as_str());
     let opts = EventsOpts::builder()
@@ -96,22 +146,28 @@ async fn handle_docker_events(state: SharedState, docker_path: String) {
         .build();
     let mut event_stream = docker.events(&opts);
     while let Some(Ok(event)) = event_stream.next().await {
-        if let (Some(action), Some(type_), Some(actor)) = (event.action, event.type_, event.actor) {
-            if type_ == "container" {
-                if let Some(attributes) = actor.attributes {
-                    if let Some(token) = attributes.get("bell.token") {
-                        match action.as_str() {
-                            "die" => {
-                                state.write().unwrap().managed_containers.remove(token);
-                            }
-                            "start" => {
-                                state.write().unwrap().managed_containers.add(attributes);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+        let (Some(action), Some(type_), Some(actor)) = (event.action, event.type_, event.actor)
+        else {
+            continue;
+        };
+        if type_ != "container" {
+            continue;
+        }
+        let Some(attributes) = actor.attributes else {
+            continue;
+        };
+        let Some(token) = attributes.get("bell.token").cloned() else {
+            continue;
+        };
+
+        match action.as_str() {
+            "die" => {
+                state.write().unwrap().managed_containers.remove(&token);
             }
+            "start" => {
+                state.write().unwrap().managed_containers.add(attributes);
+            }
+            _ => {}
         }
     }
 }
@@ -139,14 +195,11 @@ async fn run_docker_compose(
     if output.status.success() {
         Ok(())
     } else {
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Failed to run docker compose\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        )))
+        Err(Box::new(std::io::Error::other(format!(
+            "Failed to run docker compose\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))))
     }
 }
 
@@ -162,14 +215,11 @@ async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> Result<(), B
     if output.status.success() {
         Ok(())
     } else {
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Failed to run git\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        )))
+        Err(Box::new(std::io::Error::other(format!(
+            "Failed to run git\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))))
     }
 }
 
@@ -191,11 +241,17 @@ pub struct ServerErrorRes {
 
 type HandlerResult<T> = Result<T, (StatusCode, Json<ServerErrorRes>)>;
 
+fn default_remote() -> String {
+    "origin".to_string()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PostRebuildReq {
     pub key: String,
     pub build_args: Option<Vec<String>>,
-    pub commit: Option<String>,
+    pub branch: Option<String>,
+    #[serde(default = "default_remote")]
+    pub remote: String,
     #[serde(default)]
     pub all_services: bool,
 }
@@ -206,50 +262,62 @@ async fn post_rebuild(
 ) -> HandlerResult<String> {
     tracing::debug!("received: {:?}", req);
 
-    let info = state.read().unwrap().managed_containers.get(&req.key);
+    let info = {
+        let guard = state.read().unwrap();
+        guard.managed_containers.get(&req.key)
+    };
 
-    if let Some(info) = info {
-        let mut args = vec![
-            "build".to_string(),
-            "--no-cache".to_string(),
-            "--quiet".to_string(),
-        ];
-        if let Some(build_args) = req.build_args {
-            args.extend(build_args);
-        }
-        if !req.all_services {
-            args.extend(vec![info.service.clone()]);
-        }
-        async {
-            if let Some(commit) = req.commit {
-                run_git(
-                    &info,
-                    vec!["fetch".to_string(), "origin".to_string(), commit],
-                )
-                .await?;
-            }
-            run_docker_compose(&info, args).await?;
-            run_docker_compose(&info, vec!["up".to_string(), "--detach".to_string()]).await?;
-            Ok("OK".to_string())
-        }
-        .await
-        .map_err(|e: Box<dyn Error>| {
-            tracing::error!("Error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ServerErrorRes {
-                    error: e.to_string(),
-                }),
-            )
-        })
+    let info = if let Some(info) = info {
+        info
+    } else if let Some(info) = refresh_container_from_docker(state.clone(), &req.key).await {
+        info
     } else {
-        Err((
+        return Err((
             StatusCode::NOT_FOUND,
             Json(ServerErrorRes {
                 error: "Container not found".to_string(),
             }),
-        ))
+        ));
+    };
+
+    let mut args = vec![
+        "build".to_string(),
+        "--no-cache".to_string(),
+        "--quiet".to_string(),
+    ];
+    if let Some(build_args) = req.build_args {
+        args.extend(build_args);
     }
+    if !req.all_services {
+        args.extend(vec![info.service.clone()]);
+    }
+    async {
+        if let Some(branch) = req.branch {
+            run_git(
+                &info,
+                vec![
+                    "pull".to_string(),
+                    "--ff-only".to_string(),
+                    req.remote,
+                    branch,
+                ],
+            )
+            .await?;
+        }
+        run_docker_compose(&info, args).await?;
+        run_docker_compose(&info, vec!["up".to_string(), "--detach".to_string()]).await?;
+        Ok("OK".to_string())
+    }
+    .await
+    .map_err(|e: Box<dyn Error>| {
+        tracing::error!("Error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ServerErrorRes {
+                error: e.to_string(),
+            }),
+        )
+    })
 }
 
 #[derive(Parser)]
@@ -277,6 +345,7 @@ async fn main() {
     let args = Cli::parse();
 
     let shared_state = Arc::new(RwLock::new(AppState {
+        docker_path: args.docker_path.clone(),
         managed_containers: ManagedContainers::new(),
     }));
 
@@ -291,7 +360,7 @@ async fn main() {
 
     tasks.spawn(run_server(shared_state.clone(), args.address));
 
-    while let Some(_) = tasks.join_next().await {
+    while tasks.join_next().await.is_some() {
         tracing::debug!("task finished");
     }
 }
