@@ -191,8 +191,25 @@ async fn handle_docker_events(state: SharedState, docker_path: String) {
     }
 }
 
+async fn run_command(label: &str, program: &str, args: Vec<String>) -> AppResult<()> {
+    tracing::debug!("running: {} {:?}", label, args);
+    let output = tokio::process::Command::new(program)
+        .args(&args)
+        .output()
+        .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Box::new(std::io::Error::other(format!(
+            "Failed to run {}\n{}\n{}",
+            label,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))))
+    }
+}
+
 async fn run_docker_compose(info: &DockerComposeInfo, command: Vec<String>) -> AppResult<()> {
-    let docker_path = "/usr/bin/docker";
     let mut args = vec![
         "compose".to_string(),
         "--project-directory".to_string(),
@@ -203,40 +220,13 @@ async fn run_docker_compose(info: &DockerComposeInfo, command: Vec<String>) -> A
         info.project.clone(),
     ];
     args.extend(command);
-    tracing::debug!("running: docker compose {:?}", args);
-    let output = tokio::process::Command::new(docker_path)
-        .args(args)
-        .output()
-        .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Box::new(std::io::Error::other(format!(
-            "Failed to run docker compose\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ))))
-    }
+    run_command("docker compose", "/usr/bin/docker", args).await
 }
 
 async fn run_git(info: &DockerComposeInfo, command: Vec<String>) -> AppResult<()> {
-    let git_path = "/usr/bin/git";
     let mut args = vec!["-C".to_string(), info.working_dir.clone()];
     args.extend(command);
-    tracing::debug!("running: git {:?}", args);
-    let output = tokio::process::Command::new(git_path)
-        .args(args)
-        .output()
-        .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Box::new(std::io::Error::other(format!(
-            "Failed to run git\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ))))
-    }
+    run_command("git", "/usr/bin/git", args).await
 }
 
 async fn run_server(state: SharedState, address: String) -> AppResult<()> {
