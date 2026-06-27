@@ -3,6 +3,7 @@ name = "docker-bell"
 authors = ["Sven Willner <sven.willner@gmail.com>"]
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 axum = "0.8"
